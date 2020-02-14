@@ -36,11 +36,17 @@ struct DataTest: TestSuite::Tester {
 
     void debugDataFlag();
     void debugDataFlags();
+
+    void debugDataChunkType();
+    void debugDataChunkSignature();
 };
 
 DataTest::DataTest() {
     addTests({&DataTest::debugDataFlag,
-              &DataTest::debugDataFlags});
+              &DataTest::debugDataFlags,
+
+              &DataTest::debugDataChunkType,
+              &DataTest::debugDataChunkSignature});
 }
 
 void DataTest::debugDataFlag() {
@@ -55,6 +61,20 @@ void DataTest::debugDataFlags() {
 
     Debug{&out} << (DataFlag::Owned|DataFlag::Mutable) << DataFlags{};
     CORRADE_COMPARE(out.str(), "Trade::DataFlag::Owned|Trade::DataFlag::Mutable Trade::DataFlags{}\n");
+}
+
+void DataTest::debugDataChunkType() {
+    std::ostringstream out;
+
+    Debug{&out} << DataChunkType(Utility::Endianness::fourCC('M', 's', 'h', 0xab)) << DataChunkType{};
+    CORRADE_COMPARE(out.str(), "Trade::DataChunkType('M', 's', 'h', 0xab) Trade::DataChunkType(0x0, 0x0, 0x0, 0x0)\n");
+}
+
+void DataTest::debugDataChunkSignature() {
+    std::ostringstream out;
+
+    Debug{&out} << DataChunkSignature::LittleEndian64 << DataChunkSignature{};
+    CORRADE_COMPARE(out.str(), "Trade::DataChunkSignature('B', 'L', 'O', 'B') Trade::DataChunkSignature(0x0, 0x0, 0x0, 0x0)\n");
 }
 
 }}}}
