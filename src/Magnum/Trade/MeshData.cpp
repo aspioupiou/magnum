@@ -79,6 +79,80 @@ Containers::Array<MeshAttributeData> meshAttributeDataNonOwningArray(const Conta
     return Containers::Array<Trade::MeshAttributeData>{const_cast<Trade::MeshAttributeData*>(view.data()), view.size(), reinterpret_cast<void(*)(Trade::MeshAttributeData*, std::size_t)>(Trade::Implementation::nonOwnedArrayDeleter)};
 }
 
+const MeshData* MeshData::from(Containers::ArrayView<const void> data) {
+    /* Validate the header. If that fails, the error has been already printed,
+       so just propagate */
+    const DataChunk* chunk = DataChunk::from(data);
+    if(!chunk) return nullptr;
+
+    if(chunk->dataChunkType() != DataChunkType::Mesh) {
+        Error{} << "Trade::MeshData::from(): expected data chunk type" << DataChunkType::Mesh << "but got" << chunk->dataChunkType();
+        return nullptr;
+    }
+    if(data.size() < sizeof(MeshData)) {
+        Error{} << "Trade::MeshData::from(): expected at least" << sizeof(MeshData) << "bytes but got just" << data.size();
+        return nullptr;
+    }
+
+    // TODO: check that all attribute etc pointers are in range as well!
+
+    return static_cast<const MeshData*>(chunk);
+}
+
+MeshData* MeshData::from(Containers::ArrayView<void> data) {
+    return const_cast<MeshData*>(from(Containers::ArrayView<const void>{data}));
+}
+
+Containers::Array<char> MeshData::serialize() const {
+    /* Allocate the total size needed to store everything, serialize the header */
+    const std::size_t size = sizeof(MeshData) +
+        _indexData.size() + _vertexData.size() +
+        sizeof(MeshAttributeData)*_attributes.size();
+    Containers::Array<char> out{Containers::NoInit, size};
+    serializeHeaderInto(out, DataChunkType::Mesh);
+
+    MeshData& header = *reinterpret_cast<MeshData*>(out.data());
+    header._vertexCount = _vertexCount;
+    header._indexType = _indexType;
+    header._primitive = _primitive;
+    /* Both index and vertex data are owned (because it's a single blob, not
+       referencing any external data) and mutable... unless they're accessed
+       through a const pointer, in which case the mutable*() accessors are not
+       available */
+    header._indexDataFlags = header._vertexDataFlags = DataFlag::Mutable|DataFlag::Owned;
+    header._importerState = nullptr;
+    /* Data are one after another right after the header (which is denoted by
+       the nullptr) and have this size. Using the default deleter --- it's a
+       no-op on nullptr, so even if the destructor got called for some reason,
+       nothing bad would happen. */
+    header._indexData = Containers::Array<char>{nullptr, _indexData.size(), nullptr};
+    header._vertexData = Containers::Array<char>{nullptr, _vertexData.size(), nullptr};
+    header._attributes = Containers::Array<MeshAttributeData>{nullptr, _attributes.size(), nullptr};
+
+    /* Copy the index data, adjust the indices view to be an offset from the
+       base pointer to MeshData */
+    std::size_t offset = sizeof(MeshData);
+    Utility::copy(indexData(), out.slice(offset, offset + _indexData.size()));
+    header._indices = {_indices.data() - reinterpret_cast<std::ptrdiff_t>(_indexData.data()), _indices.size()};
+    offset += _indexData.size();
+
+    /* Copy the vertex data */
+    Utility::copy(vertexData(), out.slice(offset, offset + _vertexData.size()));
+    offset += _vertexData.size();
+
+    /* Copy the attribute data, adjust the attribute views to be offsets from
+       the base pointer to MeshData */
+    auto outAttributeData = Containers::arrayCast<MeshAttributeData>(out.suffix(offset));
+    Utility::copy(attributeData(), outAttributeData);
+    for(std::size_t i = 0; i != outAttributeData.size(); ++i) {
+        outAttributeData[i]._data = Containers::StridedArrayView1D<const void>{
+            {(reinterpret_cast<const char*>(_attributes[i]._data.data()) - reinterpret_cast<std::ptrdiff_t>(_vertexData.data())), ~std::size_t{}},
+            _attributes[i]._data.size(), _attributes[i]._data.stride()};
+    }
+
+    return out;
+}
+
 MeshData::MeshData(const MeshPrimitive primitive, Containers::Array<char>&& indexData, const MeshIndexData& indices, Containers::Array<char>&& vertexData, Containers::Array<MeshAttributeData>&& attributes, const UnsignedInt vertexCount, const void* const importerState) noexcept: _indexType{indices._type}, _primitive{primitive}, _indexDataFlags{DataFlag::Owned|DataFlag::Mutable}, _vertexDataFlags{DataFlag::Owned|DataFlag::Mutable}, _importerState{importerState}, _indexData{std::move(indexData)}, _vertexData{std::move(vertexData)}, _attributes{std::move(attributes)}, _indices{Containers::arrayCast<const char>(indices._data)} {
     /* Save vertex count. If it's passed explicitly, use that (but still check
        that all attributes have the same vertex count for safety), otherwise
@@ -194,10 +268,25 @@ MeshData::MeshData(MeshData&&) noexcept = default;
 
 MeshData& MeshData::operator=(MeshData&&) noexcept = default;
 
+Containers::ArrayView<const char> MeshData::indexData() const & {
+    if(!isDataChunk()) return _indexData;
+    return {reinterpret_cast<const char*>(this) + sizeof(MeshData), _indexData.size()};
+}
+
 Containers::ArrayView<char> MeshData::mutableIndexData() & {
     CORRADE_ASSERT(_indexDataFlags & DataFlag::Mutable,
         "Trade::MeshData::mutableIndexData(): index data not mutable", {});
     return _indexData;
+}
+
+Containers::ArrayView<const MeshAttributeData> MeshData::attributeData() const & {
+    if(!isDataChunk()) return _attributes;
+    return {reinterpret_cast<const MeshAttributeData*>(reinterpret_cast<std::ptrdiff_t>(this) + sizeof(MeshData) + _indexData.size() + _vertexData.size()), _attributes.size()};
+}
+
+Containers::ArrayView<const char> MeshData::vertexData() const & {
+    if(!isDataChunk()) return _vertexData;
+    return {reinterpret_cast<const char*>(this) + sizeof(MeshData) + _indexData.size(), _vertexData.size()};
 }
 
 Containers::ArrayView<char> MeshData::mutableVertexData() & {
@@ -229,7 +318,7 @@ Containers::StridedArrayView2D<const char> MeshData::indices() const {
         "Trade::MeshData::indices(): the mesh is not indexed", {});
     const std::size_t indexTypeSize = meshIndexTypeSize(_indexType);
     /* Build a 2D view using information about attribute type size */
-    return {_indices, {_indices.size()/indexTypeSize, indexTypeSize}};
+    return {{_indices.data() + (isDataChunk() ? reinterpret_cast<std::ptrdiff_t>(this) + sizeof(MeshData) : 0), _indices.size()}, {_indices.size()/indexTypeSize, indexTypeSize}};
 }
 
 Containers::StridedArrayView2D<char> MeshData::mutableIndices() {
@@ -251,33 +340,34 @@ Containers::StridedArrayView2D<char> MeshData::mutableIndices() {
 MeshAttributeData MeshData::attributeData(UnsignedInt id) const {
     CORRADE_ASSERT(id < _attributes.size(),
         "Trade::MeshData::attributeData(): index" << id << "out of range for" << _attributes.size() << "attributes", MeshAttributeData{});
-    const MeshAttributeData& attribute = _attributes[id];
+    const MeshAttributeData& attribute = attributeDataInternal()[id];
     return MeshAttributeData{attribute._name, attribute._format, attributeDataViewInternal(attribute)};
 }
 
 MeshAttribute MeshData::attributeName(UnsignedInt id) const {
     CORRADE_ASSERT(id < _attributes.size(),
         "Trade::MeshData::attributeName(): index" << id << "out of range for" << _attributes.size() << "attributes", {});
-    return _attributes[id]._name;
+    return attributeDataInternal()[id]._name;
 }
 
 VertexFormat MeshData::attributeFormat(UnsignedInt id) const {
     CORRADE_ASSERT(id < _attributes.size(),
         "Trade::MeshData::attributeFormat(): index" << id << "out of range for" << _attributes.size() << "attributes", {});
-    return _attributes[id]._format;
+    return attributeDataInternal()[id]._type;
 }
 
 std::size_t MeshData::attributeOffset(UnsignedInt id) const {
     CORRADE_ASSERT(id < _attributes.size(),
         "Trade::MeshData::attributeOffset(): index" << id << "out of range for" << _attributes.size() << "attributes", {});
-    return _attributes[id]._isOffsetOnly ? _attributes[id]._data.offset :
-        static_cast<const char*>(_attributes[id]._data.pointer) - _vertexData.data();
+    const MeshAttributeData& attribute = attributeDataInternal()[id];
+    return attribute._isOffsetOnly ? attribute._data.offset :
+        static_cast<const char*>(attribute._data.pointer) - _vertexData.data();
 }
 
 UnsignedInt MeshData::attributeStride(UnsignedInt id) const {
     CORRADE_ASSERT(id < _attributes.size(),
         "Trade::MeshData::attributeStride(): index" << id << "out of range for" << _attributes.size() << "attributes", {});
-    return _attributes[id]._stride;
+    return attributeDataInternal()[id]._stride;
 }
 
 UnsignedShort MeshData::attributeArraySize(UnsignedInt id) const {
@@ -288,14 +378,16 @@ UnsignedShort MeshData::attributeArraySize(UnsignedInt id) const {
 
 UnsignedInt MeshData::attributeCount(const MeshAttribute name) const {
     UnsignedInt count = 0;
-    for(const MeshAttributeData& attribute: _attributes)
-        if(attribute._name == name) ++count;
+    const MeshAttributeData* const attributes = attributeDataInternal();
+    for(std::size_t i = 0; i != _attributes.size(); ++i)
+        if(attributes[i]._name == name) ++count;
     return count;
 }
 
 UnsignedInt MeshData::attributeFor(const MeshAttribute name, UnsignedInt id) const {
+    const MeshAttributeData* const attributes = attributeDataInternal();
     for(std::size_t i = 0; i != _attributes.size(); ++i) {
-        if(_attributes[i]._name != name) continue;
+        if(attributes[i]._name != name) continue;
         if(id-- == 0) return i;
     }
 
@@ -304,6 +396,12 @@ UnsignedInt MeshData::attributeFor(const MeshAttribute name, UnsignedInt id) con
     #else
     return ~UnsignedInt{};
     #endif
+}
+
+const MeshAttributeData* MeshData::attributeDataInternal() const {
+    if(!isDataChunk()) return _attributes.data();
+
+    return reinterpret_cast<const MeshAttributeData*>(reinterpret_cast<std::ptrdiff_t>(this) + sizeof(MeshData) + _indexData.size() + _vertexData.size());
 }
 
 UnsignedInt MeshData::attributeId(const MeshAttribute name, UnsignedInt id) const {
@@ -351,8 +449,8 @@ Containers::StridedArrayView1D<const void> MeshData::attributeDataViewInternal(c
 Containers::StridedArrayView2D<const char> MeshData::attribute(UnsignedInt id) const {
     CORRADE_ASSERT(id < _attributes.size(),
         "Trade::MeshData::attribute(): index" << id << "out of range for" << _attributes.size() << "attributes", nullptr);
-    const MeshAttributeData& attribute = _attributes[id];
     /* Build a 2D view using information about attribute type size */
+    const MeshAttributeData& attribute = attributeDataInternal()[id];
     return Containers::arrayCast<2, const char>(
         attributeDataViewInternal(attribute),
         isVertexFormatImplementationSpecific(attribute._format) ?
@@ -365,8 +463,8 @@ Containers::StridedArrayView2D<char> MeshData::mutableAttribute(UnsignedInt id) 
         "Trade::MeshData::mutableAttribute(): vertex data not mutable", {});
     CORRADE_ASSERT(id < _attributes.size(),
         "Trade::MeshData::mutableAttribute(): index" << id << "out of range for" << _attributes.size() << "attributes", nullptr);
-    const MeshAttributeData& attribute = _attributes[id];
     /* Build a 2D view using information about attribute type size */
+    const MeshAttributeData& attribute = attributeDataInternal()[id];
     auto out = Containers::arrayCast<2, const char>(
         attributeDataViewInternal(attribute),
         isVertexFormatImplementationSpecific(attribute._format) ?
